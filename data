@@ -1,0 +1,756 @@
+import glob
+import os
+import re
+import shutil
+import sys
+import time
+import zipfile
+from contextlib import ExitStack
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
+
+import numpy as np
+import rasterio
+import requests
+from affine import Affine
+from rasterio.warp import Resampling, reproject
+from requests.exceptions import (
+    ChunkedEncodingError,
+    ConnectTimeout,
+    ConnectionError,
+    ReadTimeout,
+    SSLError,
+)
+from tqdm import tqdm
+
+# ============================================================
+# 1) 配置区
+# ============================================================
+CDSE_TOTP = os.getenv("CDSE_TOTP", "").strip()  # 2FA 才填
+
+AOI_WKT = (
+    "POLYGON((122.229172 28.856657, 118.623426 29.195897, 118.409516 29.395919, "
+    "118.340264 29.463936, 118.340329 29.481841, 118.879419 30.318166, "
+    "119.637032 31.151684, 119.667358 31.16729, 121.264416 31.856551, "
+    "121.293216 31.866154, 121.337019 31.851022, 121.879638 31.632657, "
+    "122.828296 30.727085, 122.831992 30.718996, 122.833454 30.706917, "
+    "122.78279 30.130459, 122.262592 28.883663, 122.23644 28.857529, "
+    "122.229172 28.856657))"
+)
+
+START_DATE = "20250101"
+END_DATE = "20250630"
+
+COLLECTION_NAME = "SENTINEL-2"
+PRODUCT_TYPE = "S2MSI2A"
+MAX_CLOUD_COVER = 10
+
+SELECT_BEST_PER_MONTH_TILE = False  # 10天合成通常不建议再做每月筛选
+MAX_PRODUCTS = 0  # 0 不限制
+
+APPLY_SCALE_TO_0_1 = True
+SCALE_FACTOR = 1.0 / 10000.0
+NODATA_VALUE = -9999.0
+TARGET_RESOLUTION_M = 30
+COMPOSITE_WINDOW_DAYS = 10
+WINDOW_ANCHOR_DATE = "20250101"  # 固定窗口锚点(YYYYMMDD)，如需跟随首景可设为""
+
+BASE_DIR = Path("F:/cdse_s2_hangzhou_bay2025").resolve()
+DOWNLOAD_DIR = BASE_DIR / "raw_zip"
+EXTRACT_DIR = BASE_DIR / "safe"
+OUTPUT_DIR = BASE_DIR / "stack30m_cloudmasked"
+COMPOSITE_DIR = BASE_DIR / "composite10d_median_30m"
+LOG_DIR = BASE_DIR / "logs"
+
+for d in (DOWNLOAD_DIR, EXTRACT_DIR, OUTPUT_DIR, COMPOSITE_DIR, LOG_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+class Tee:
+    """同时输出到终端和日志文件。"""
+
+    def __init__(self, stream: Any, logfile: Any):
+        self.stream = stream
+        self.logfile = logfile
+
+    def write(self, data: str) -> None:
+        self.stream.write(data)
+        self.logfile.write(data)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.logfile.flush()
+
+
+# ============================================================
+# 2) CDSE endpoints
+# ============================================================
+TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+CATALOGUE_ODATA = "https://catalogue.dataspace.copernicus.eu/odata/v1"
+DOWNLOAD_ODATA = "https://download.dataspace.copernicus.eu/odata/v1"
+
+
+ALL_BANDS: list[tuple[str, str, str, int]] = [
+    ("B02", "R10m", "10m", 10),
+    ("B03", "R10m", "10m", 10),
+    ("B04", "R10m", "10m", 10),
+    ("B08", "R10m", "10m", 10),
+    ("B05", "R20m", "20m", 20),
+    ("B06", "R20m", "20m", 20),
+    ("B07", "R20m", "20m", 20),
+    ("B8A", "R20m", "20m", 20),
+    ("B11", "R20m", "20m", 20),
+    ("B12", "R20m", "20m", 20),
+    ("B01", "R60m", "60m", 60),
+    ("B09", "R60m", "60m", 60),
+    ("B10", "R60m", "60m", 60),
+]
+
+
+def _request_with_retry(method: str, url: str, **kwargs: Any) -> requests.Response:
+    max_attempts = kwargs.pop("max_attempts", 6)
+    backoff = kwargs.pop("backoff", 3)
+    retry_statuses = {429, 500, 502, 503, 504}
+
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code in retry_statuses:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            return resp
+        except (SSLError, ReadTimeout, ConnectTimeout, ConnectionError, RuntimeError) as exc:
+            last_err = exc
+            if attempt == max_attempts:
+                break
+            wait = min(backoff, 60)
+            print(f"[WARN] 网络异常({attempt}/{max_attempts})，{wait}s 后重试: {exc}")
+            time.sleep(wait)
+            backoff *= 2
+
+    raise RuntimeError(f"请求失败: {url} | {last_err}")
+
+
+def _require_creds() -> tuple[str, str]:
+    username = os.getenv("CDSE_USERNAME", "").strip()
+    password = os.getenv("CDSE_PASSWORD", "").strip()
+    if not username or not password:
+        raise RuntimeError(
+            "未检测到 CDSE_USERNAME / CDSE_PASSWORD 环境变量。\n"
+            "PowerShell:\n"
+            '  $env:CDSE_USERNAME="your_email"; '
+            '$env:CDSE_PASSWORD="your_password"; python cdse_s2_pipeline.py\n'
+        )
+    return username, password
+
+
+def _norm_wkt(wkt: str) -> str:
+    return re.sub(r"\s+", " ", wkt.strip())
+
+
+def _yyyymmdd_to_isoz(date_str: str, end: bool = False) -> str:
+    dt = datetime.strptime(date_str, "%Y%m%d")
+    if end:
+        dt = dt + timedelta(days=1)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def get_access_token() -> str:
+    username, password = _require_creds()
+    data = {
+        "client_id": "cdse-public",
+        "grant_type": "password",
+        "username": username,
+        "password": password,
+    }
+    if CDSE_TOTP:
+        data["totp"] = CDSE_TOTP
+
+    response = _request_with_retry(
+        "POST",
+        TOKEN_URL,
+        data=data,
+        timeout=(20, 60),
+        max_attempts=6,
+        backoff=4,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"获取 token 失败: {response.status_code}\n{response.text}")
+    return response.json()["access_token"]
+
+
+def extract_tile(name: str) -> str:
+    m = re.search(r"_T(\d{2}[A-Z]{3})_", name)
+    return m.group(1) if m else "UNKNOWN"
+
+
+def extract_date(name: str) -> datetime | None:
+    m = re.search(r"_(\d{8})T\d{6}_", name)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y%m%d")
+
+
+def extract_month_from_contentdate(product: dict[str, Any]) -> str:
+    start = (product.get("ContentDate") or {}).get("Start", "")
+    return start[:7] if len(start) >= 7 else "UNKNOWN"
+
+
+def get_cloud_cover(product: dict[str, Any]) -> float:
+    for attr in product.get("Attributes") or []:
+        if isinstance(attr, dict) and attr.get("Name") == "cloudCover":
+            try:
+                return float(attr.get("Value"))
+            except (TypeError, ValueError):
+                return 999.0
+    return 999.0
+
+
+def select_best_per_month_tile(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    best: dict[tuple[str, str], tuple[tuple[float, str], dict[str, Any]]] = {}
+
+    for product in products:
+        tile = extract_tile(product.get("Name", ""))
+        month = extract_month_from_contentdate(product)
+        start = (product.get("ContentDate") or {}).get("Start", "")
+        cloud = get_cloud_cover(product)
+
+        key = (month, tile)
+        score = (cloud, start)
+        if key not in best or score < best[key][0]:
+            best[key] = (score, product)
+
+    selected = [item[1] for item in best.values()]
+    selected.sort(
+        key=lambda x: ((x.get("ContentDate") or {}).get("Start", ""), extract_tile(x.get("Name", "")))
+    )
+    return selected
+
+
+def odata_search_products(
+    aoi_wkt: str,
+    start_iso: str,
+    end_iso: str,
+    max_cloud: float,
+    page_size: int = 100,
+) -> list[dict[str, Any]]:
+    aoi_wkt = _norm_wkt(aoi_wkt)
+
+    filter_expr = (
+        f"Collection/Name eq '{COLLECTION_NAME}'"
+        f" and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and "
+        f"att/OData.CSC.StringAttribute/Value eq '{PRODUCT_TYPE}')"
+        f" and OData.CSC.Intersects(area=geography'SRID=4326;{aoi_wkt}')"
+        f" and ContentDate/Start gt {start_iso}"
+        f" and ContentDate/Start lt {end_iso}"
+        " and Online eq true"
+        f" and Attributes/OData.CSC.DoubleAttribute/any(att:att/Name eq 'cloudCover' and "
+        f"att/OData.CSC.DoubleAttribute/Value le {float(max_cloud)})"
+    )
+
+    results: list[dict[str, Any]] = []
+    skip = 0
+
+    while True:
+        params = {
+            "$filter": filter_expr,
+            "$orderby": "ContentDate/Start asc",
+            "$expand": "Attributes",
+            "$select": "Id,Name,ContentDate,Online,Attributes",
+            "$top": page_size,
+            "$skip": skip,
+        }
+        url = f"{CATALOGUE_ODATA}/Products?{urlencode(params)}"
+
+        response = _request_with_retry("GET", url, timeout=(20, 60), max_attempts=6, backoff=3)
+        if response.status_code != 200:
+            raise RuntimeError(f"OData 查询失败: {response.status_code}\n{response.text}")
+
+        batch = response.json().get("value", [])
+        if not batch:
+            break
+
+        results.extend(batch)
+        skip += page_size
+
+    return results
+
+
+def is_zip_valid(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return zf.testzip() is None
+    except Exception:
+        return False
+
+
+def download_product_zip(access_token: str, product_id: str, product_name: str, out_zip: Path) -> str:
+    if out_zip.exists() and (out_zip.stat().st_size < 1024 * 1024 or not is_zip_valid(out_zip)):
+        print(f"[WARN] ZIP 损坏，删除重下: {out_zip.name}")
+        out_zip.unlink(missing_ok=True)
+
+    if out_zip.exists() and out_zip.stat().st_size > 1024 * 1024 and is_zip_valid(out_zip):
+        return access_token
+
+    tmp_zip = out_zip.with_suffix(f"{out_zip.suffix}.part")
+
+    session = requests.Session()
+
+    def _download_once(token: str) -> requests.Response:
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{DOWNLOAD_ODATA}/Products({product_id})/$value"
+        return session.get(url, headers=headers, stream=True, timeout=(30, 300), allow_redirects=True)
+
+    backoff = 8
+    for attempt in range(1, 6):
+        try:
+            response = _download_once(access_token)
+
+            if response.status_code == 401:
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = {}
+                message = str(payload.get("message", "")).lower()
+                code = payload.get("code")
+                if "token is expired" in message or code == "DAT-ZIP-109":
+                    print(f"[INFO] Token 过期，刷新后重试: {product_name}")
+                    access_token = get_access_token()
+                    response = _download_once(access_token)
+
+            if response.status_code != 200:
+                body = response.text[:500] if response.text else ""
+                raise RuntimeError(f"下载失败 {product_name}: {response.status_code}\n{body}")
+
+            total = int(response.headers.get("Content-Length", 0))
+            with open(tmp_zip, "wb") as fh, tqdm(
+                total=total if total > 0 else None,
+                unit="B",
+                unit_scale=True,
+                leave=False,
+                desc=f"Downloading {product_name}",
+            ) as progress:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+                        if total > 0:
+                            progress.update(len(chunk))
+
+            tmp_zip.replace(out_zip)
+            if not is_zip_valid(out_zip):
+                out_zip.unlink(missing_ok=True)
+                raise ChunkedEncodingError("ZIP 校验失败")
+
+            return access_token
+
+        except (ReadTimeout, ConnectionError, SSLError, ChunkedEncodingError, ConnectTimeout, RuntimeError) as exc:
+            tmp_zip.unlink(missing_ok=True)
+            if attempt == 5:
+                raise RuntimeError(f"下载失败 {product_name}: {exc}") from exc
+            print(f"[WARN] 下载异常({attempt}/5)，{backoff}s 后重试: {product_name} | {exc}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+
+    return access_token
+
+
+def unzip_safe(zip_path: Path, extract_root: Path) -> Path:
+    target_dir = extract_root / zip_path.stem
+    complete_flag = target_dir / ".extract_complete"
+
+    if target_dir.exists() and not complete_flag.exists():
+        print(f"[WARN] 检测到不完整解压目录，删除后重解压: {target_dir}")
+        shutil.rmtree(target_dir, ignore_errors=True)
+
+    if not complete_flag.exists():
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(target_dir)
+        complete_flag.write_text("ok", encoding="utf-8")
+
+    safe_dirs = list(target_dir.rglob("*.SAFE"))
+    if not safe_dirs:
+        raise FileNotFoundError(f"解压后没找到 .SAFE: {zip_path}")
+    return safe_dirs[0]
+
+
+def _pick_one(patterns: list[str]) -> str:
+    for pattern in patterns:
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            return matches[0]
+    return ""
+
+
+def _find_band(granule_dir: Path, res_folder: str, band: str, tag: str) -> str:
+    return _pick_one(
+        [
+            str(granule_dir / "**" / "IMG_DATA" / res_folder / f"*{band}_{tag}*.jp2"),
+            str(granule_dir / "**" / "IMG_DATA" / res_folder / f"*{band}_{tag}*.tif"),
+        ]
+    )
+
+
+def _read_band_with_valid_mask(src: rasterio.io.DatasetReader) -> tuple[np.ndarray, np.ndarray]:
+    arr = src.read(1).astype(np.float32)
+    valid = src.read_masks(1) > 0
+    if src.nodata is not None:
+        valid &= arr != float(src.nodata)
+    return arr, valid
+
+
+def _reproject_with_fill(
+    source: np.ndarray,
+    src_transform: Any,
+    src_crs: Any,
+    dst_transform: Any,
+    dst_crs: Any,
+    dst_shape: tuple[int, int],
+    resampling: Resampling,
+    src_nodata: float | None,
+    dst_nodata: float,
+) -> np.ndarray:
+    destination = np.full(dst_shape, dst_nodata, dtype=np.float32)
+    reproject(
+        source=source,
+        destination=destination,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=resampling,
+        src_nodata=src_nodata,
+        dst_nodata=dst_nodata,
+    )
+    return destination
+
+
+def _make_target_grid(ref: rasterio.io.DatasetReader) -> tuple[Any, int, int, Any]:
+    scale = TARGET_RESOLUTION_M / 10.0
+    dst_w = max(1, int(np.ceil(ref.width / scale)))
+    dst_h = max(1, int(np.ceil(ref.height / scale)))
+    dst_transform = ref.transform * Affine.scale(scale, scale)
+    return dst_transform, dst_h, dst_w, ref.crs
+
+
+def stack_10m_20m_resample_to_30m_and_mask(safe_dir: Path, out_dir: Path) -> list[Path]:
+    granules = list((safe_dir / "GRANULE").glob("*"))
+    if not granules:
+        raise FileNotFoundError(f"SAFE 缺少 GRANULE: {safe_dir}")
+
+    mask_scl_values = {0, 1, 3, 8, 9, 10, 11}
+    output_files: list[Path] = []
+
+    for granule in granules:
+        granule_id = granule.name
+        b02_path = _find_band(granule, "R10m", "B02", "10m")
+        if not b02_path:
+            print(f"[WARN] 缺少 B02_10m，跳过: {granule_id}")
+            continue
+
+        scl_path = _pick_one(
+            [
+                str(granule / "**" / "IMG_DATA" / "R20m" / "*SCL_20m*.jp2"),
+                str(granule / "**" / "IMG_DATA" / "R20m" / "*SCL_20m*.tif"),
+            ]
+        )
+        if not scl_path:
+            print(f"[WARN] 缺少 SCL_20m，跳过: {granule_id}")
+            continue
+
+        with rasterio.open(b02_path) as ref:
+            dst_transform, dst_h, dst_w, dst_crs = _make_target_grid(ref)
+            ref_transform = ref.transform
+            ref_h, ref_w = ref.height, ref.width
+
+        with rasterio.open(scl_path) as src_scl:
+            scl_src = src_scl.read(1)
+            scl_transform = src_scl.transform
+            scl_crs = src_scl.crs
+            scl_src_valid = src_scl.read_masks(1) > 0
+            scl_20_cloud = (~scl_src_valid) | np.isin(scl_src, list(mask_scl_values))
+
+            # 10m波段严格先去云：先把20m SCL云掩膜重采样到10m
+            cloud_10m_u8 = np.zeros((ref_h, ref_w), dtype=np.uint8)
+            reproject(
+                source=scl_20_cloud.astype(np.uint8),
+                destination=cloud_10m_u8,
+                src_transform=scl_transform,
+                src_crs=scl_crs,
+                dst_transform=ref_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+            )
+            cloud_10m = cloud_10m_u8 > 0
+
+            # 30m采用保守云掩膜：目标像元范围内出现任意云都掩
+            cloud_target_ratio = np.zeros((dst_h, dst_w), dtype=np.float32)
+            reproject(
+                source=scl_20_cloud.astype(np.float32),
+                destination=cloud_target_ratio,
+                src_transform=scl_transform,
+                src_crs=scl_crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.average,
+            )
+            cloud = cloud_target_ratio > 0
+
+        stack: list[np.ndarray] = []
+        band_names: list[str] = []
+
+        for band, folder, tag, src_res in ALL_BANDS:
+            band_path = _find_band(granule, folder, band, tag)
+            if not band_path:
+                print(f"[WARN] 缺少 {band}_{tag}，以全NODATA补齐: {granule_id}")
+                stack.append(np.full((dst_h, dst_w), NODATA_VALUE, dtype=np.float32))
+                band_names.append(band)
+                continue
+
+            with rasterio.open(band_path) as src:
+                src_arr, src_valid = _read_band_with_valid_mask(src)
+                src_arr[~src_valid] = NODATA_VALUE
+
+                if src_res == 10:
+                    src_arr[cloud_10m] = NODATA_VALUE
+                elif src_res == 20:
+                    src_arr[scl_20_cloud] = NODATA_VALUE
+                elif src_res == 60:
+                    cloud_60m_u8 = np.zeros((src.height, src.width), dtype=np.uint8)
+                    reproject(
+                        source=scl_20_cloud.astype(np.uint8),
+                        destination=cloud_60m_u8,
+                        src_transform=scl_transform,
+                        src_crs=scl_crs,
+                        dst_transform=src.transform,
+                        dst_crs=src.crs,
+                        resampling=Resampling.nearest,
+                    )
+                    src_arr[cloud_60m_u8 > 0] = NODATA_VALUE
+
+                resampling_method = Resampling.average if src_res in (10, 20) else Resampling.bilinear
+                dst_arr = _reproject_with_fill(
+                    source=src_arr,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    dst_shape=(dst_h, dst_w),
+                    resampling=resampling_method,
+                    src_nodata=NODATA_VALUE,
+                    dst_nodata=NODATA_VALUE,
+                )
+
+            if APPLY_SCALE_TO_0_1:
+                valid_dst = dst_arr != NODATA_VALUE
+                dst_arr[valid_dst] *= SCALE_FACTOR
+
+            dst_arr[cloud] = NODATA_VALUE
+            stack.append(dst_arr)
+            band_names.append(band)
+
+        out_path = out_dir / f"{safe_dir.name}_{granule_id}_STACK30m_10m20m60m_cloudMasked.tif"
+        profile = {
+            "driver": "GTiff",
+            "height": dst_h,
+            "width": dst_w,
+            "count": len(stack),
+            "crs": dst_crs,
+            "transform": dst_transform,
+            "dtype": "float32",
+            "compress": "LZW",
+            "nodata": float(NODATA_VALUE),
+            "tiled": True,
+            "bigtiff": "IF_SAFER",
+        }
+
+        # 逐景mask使用并集(any_valid)，并且不对波段做“一坏全坏”扩散
+        any_valid = np.any(np.stack([(arr != NODATA_VALUE) for arr in stack], axis=0), axis=0)
+
+        print(
+            f"[STAT] {safe_dir.name} {granule_id} | "
+            f"cloud_ratio={float(np.mean(cloud)):.4f} | "
+            f"any_valid_ratio={float(np.mean(any_valid)):.4f}"
+        )
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            for idx, arr in enumerate(stack, start=1):
+                dst.write(arr, idx)
+                try:
+                    dst.set_band_description(idx, band_names[idx - 1])
+                except Exception:
+                    pass
+            dst.write_mask(any_valid.astype(np.uint8) * 255)
+
+        output_files.append(out_path)
+        print(f"[OK] {out_path.name} | bands={len(stack)} | {band_names}")
+
+    return output_files
+
+
+def _window_start(dt: datetime, base: datetime, window_days: int) -> datetime:
+    offset = (dt - base).days
+    return base + timedelta(days=(offset // window_days) * window_days)
+
+
+def _composite_anchor_date(parsed_dates: list[datetime]) -> datetime:
+    if WINDOW_ANCHOR_DATE.strip():
+        return datetime.strptime(WINDOW_ANCHOR_DATE.strip(), "%Y%m%d")
+    return min(parsed_dates)
+
+
+def composite_10day_median(masked_files: list[Path], out_dir: Path, window_days: int = 10) -> list[Path]:
+    grouped: dict[tuple[str, datetime], list[Path]] = {}
+
+    parsed: list[tuple[datetime, str, Path]] = []
+    for path in masked_files:
+        product_name = path.name.split("_MSIL2A_")[0] + "_MSIL2A_" + path.name.split("_MSIL2A_")[1].split("_N")[0] if "_MSIL2A_" in path.name else path.name
+        dt = extract_date(path.name) or extract_date(product_name)
+        tile = extract_tile(path.name)
+        if not dt or tile == "UNKNOWN":
+            print(f"[WARN] 无法解析日期或tile，跳过合成: {path.name}")
+            continue
+        parsed.append((dt, tile, path))
+
+    if not parsed:
+        return []
+
+    base_date = _composite_anchor_date([item[0] for item in parsed])
+
+    for dt, tile, path in parsed:
+        ws = _window_start(dt, base_date, window_days)
+        grouped.setdefault((tile, ws), []).append(path)
+
+    outputs: list[Path] = []
+    for (tile, ws), files in sorted(grouped.items(), key=lambda x: (x[0][1], x[0][0])):
+        if len(files) == 1:
+            print(f"[INFO] {tile} {ws:%Y-%m-%d} 窗口仅1景，仍输出单景中值结果")
+
+        end = ws + timedelta(days=window_days - 1)
+        out_path = out_dir / f"T{tile}_{ws:%Y%m%d}_{end:%Y%m%d}_median{window_days}d_30m.tif"
+
+        with ExitStack() as stack:
+            srcs = [stack.enter_context(rasterio.open(f)) for f in files]
+            ref = srcs[0]
+
+            for src in srcs[1:]:
+                if (
+                    src.width != ref.width
+                    or src.height != ref.height
+                    or src.count != ref.count
+                    or src.crs != ref.crs
+                    or src.transform != ref.transform
+                ):
+                    raise RuntimeError(f"合成输入网格不一致: {src.name}")
+
+            profile = ref.profile.copy()
+            profile.update(nodata=float(NODATA_VALUE), dtype="float32", compress="LZW", tiled=True, bigtiff="IF_SAFER")
+            band_names = [ref.descriptions[i] or f"B{i+1}" for i in range(ref.count)]
+
+            with rasterio.open(out_path, "w", **profile) as dst:
+                for _, window in ref.block_windows(1):
+                    win_h = window.height
+                    win_w = window.width
+
+                    cube = np.full((len(srcs), ref.count, win_h, win_w), np.nan, dtype=np.float32)
+                    for i, src in enumerate(srcs):
+                        arr = src.read(window=window).astype(np.float32)
+                        nodata = src.nodata if src.nodata is not None else NODATA_VALUE
+                        arr[arr == nodata] = np.nan
+
+                        band_valid = src.read_masks(window=window) > 0
+                        arr[~band_valid] = np.nan
+                        cube[i] = arr
+
+                    with np.errstate(all="ignore"):
+                        out_block = np.nanmedian(cube, axis=0).astype(np.float32)
+                    band_all_nan = np.all(np.isnan(cube), axis=0)
+                    out_block[band_all_nan] = NODATA_VALUE
+
+                    # 合成输出mask用并集(any_valid)，仍保持每波段独立中值
+                    any_valid_block = np.any(~band_all_nan, axis=0)
+                    out_block[:, ~any_valid_block] = NODATA_VALUE
+
+                    dst.write(out_block, window=window)
+                    dst.write_mask((any_valid_block.astype(np.uint8) * 255), window=window)
+
+                for bi, name in enumerate(band_names, 1):
+                    try:
+                        dst.set_band_description(bi, name)
+                    except Exception:
+                        pass
+
+        print(f"[OK] 10天中值合成: {out_path.name} | 输入景数={len(files)}")
+        outputs.append(out_path)
+
+    return outputs
+
+
+def main() -> None:
+    print("1) 获取 access token ...")
+    token = get_access_token()
+    print("   token OK")
+
+    start_iso = _yyyymmdd_to_isoz(START_DATE, end=False)
+    end_iso = _yyyymmdd_to_isoz(END_DATE, end=True)
+
+    print(f"\n2) OData 搜索: {START_DATE} ~ {END_DATE}, cloudCover<= {MAX_CLOUD_COVER}")
+    products = odata_search_products(AOI_WKT, start_iso, end_iso, MAX_CLOUD_COVER)
+    print(f"   找到 {len(products)} 景（未去重）")
+
+    seen = set()
+    uniq: list[dict[str, Any]] = []
+    for p in products:
+        pid = p.get("Id")
+        if pid and pid not in seen:
+            uniq.append(p)
+            seen.add(pid)
+
+    print(f"\n3) 总计唯一影像数(去重后): {len(uniq)}")
+
+    if SELECT_BEST_PER_MONTH_TILE:
+        before = len(uniq)
+        uniq = select_best_per_month_tile(uniq)
+        print(f"[INFO] 已按每月每 tile 最优筛选: {before} -> {len(uniq)}")
+
+    if MAX_PRODUCTS and len(uniq) > MAX_PRODUCTS:
+        print(f"[INFO] 只处理前 {MAX_PRODUCTS} 景")
+        uniq = uniq[:MAX_PRODUCTS]
+
+    print("\n4) 下载 + 解压 + 逐景云掩膜 ...")
+    masked_files: list[Path] = []
+    for product in tqdm(uniq, desc="Products"):
+        pid = product["Id"]
+        name = product["Name"]
+        out_zip = DOWNLOAD_DIR / f"{name}.zip"
+
+        try:
+            token = download_product_zip(token, pid, name, out_zip)
+            safe_dir = unzip_safe(out_zip, EXTRACT_DIR)
+            masked_files.extend(stack_10m_20m_resample_to_30m_and_mask(safe_dir, OUTPUT_DIR))
+        except Exception as exc:
+            print(f"[ERR] 处理失败 {name}: {exc}")
+            continue
+
+    print(f"\n5) {COMPOSITE_WINDOW_DAYS}天窗口中值合成(先云掩膜后合成) ...")
+    composites = composite_10day_median(masked_files, COMPOSITE_DIR, COMPOSITE_WINDOW_DAYS)
+    print(f"[DONE] 合成完成，共 {len(composites)} 个结果。输出目录：{COMPOSITE_DIR}")
+
+
+if __name__ == "__main__":
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = LOG_DIR / f"pipeline_{ts}.log"
+    with open(log_path, "w", encoding="utf-8") as log_fh:
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = Tee(old_stdout, log_fh)
+        sys.stderr = Tee(old_stderr, log_fh)
+        try:
+            print(f"[INFO] 日志文件: {log_path}")
+            main()
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
